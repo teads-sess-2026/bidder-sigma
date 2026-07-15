@@ -4,6 +4,9 @@ import com.teads.summerschool.stats.dto.CreativeStatsResponse;
 import com.teads.summerschool.stats.dto.StatsResponse;
 import com.teads.summerschool.stats.dto.TargetingResponse;
 import com.teads.summerschool.stats.dto.TimeseriesResponse;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -28,12 +31,19 @@ public class StatsController {
     }
 
     /** GET /api/stats — overall snapshot */
+    @Operation(summary = "Overall stats snapshot")
+    @ApiResponse(responseCode = "200", description = "Overall stats")
     @GetMapping
     public ResponseEntity<StatsResponse> stats() {
         return ResponseEntity.ok(statsService.getStats());
     }
 
     /** GET /api/stats/creatives?creative_id=&sort=spend&order=desc */
+    @Operation(summary = "Per-creative stats")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Creative stats"),
+            @ApiResponse(responseCode = "400", description = "Invalid sort/order")
+    })
     @GetMapping("/creatives")
     public ResponseEntity<?> creatives(
             @RequestParam(required = false) String creative_id,
@@ -47,6 +57,11 @@ public class StatsController {
     }
 
     /** GET /api/stats/targeting?dimension=all */
+    @Operation(summary = "Targeting stats")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Targeting stats"),
+            @ApiResponse(responseCode = "400", description = "Invalid dimension")
+    })
     @GetMapping("/targeting")
     public ResponseEntity<?> targeting(
             @RequestParam(defaultValue = "all") String dimension) {
@@ -57,6 +72,8 @@ public class StatsController {
     }
 
     /** GET /api/stats/timeseries?window_minutes=30&bucket_seconds=60 */
+    @Operation(summary = "Stats timeseries")
+    @ApiResponse(responseCode = "200", description = "Timeseries data")
     @GetMapping("/timeseries")
     public ResponseEntity<TimeseriesResponse> timeseries(
             @RequestParam(name = "window_minutes", defaultValue = "30") int windowMinutes,

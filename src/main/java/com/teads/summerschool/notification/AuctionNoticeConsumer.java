@@ -50,7 +50,7 @@ public class AuctionNoticeConsumer {
 
             boolean won = properties.getId().equals(notice.getWinningBidderId());
 
-            log.debug("KAFKA  id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
+            log.info("KAFKA  id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
 
             if (won) {
                 // TODO: handle win — record the win, decrement creative budget, update metrics

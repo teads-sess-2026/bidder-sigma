@@ -2,6 +2,9 @@ package com.teads.summerschool.bidding;
 
 import com.teads.summerschool.bidding.dto.BidRequest;
 import com.teads.summerschool.config.BidderProperties;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
@@ -24,6 +27,11 @@ public class BidController {
         this.properties = properties;
     }
 
+    @Operation(summary = "Submit a bid request")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Bid returned"),
+            @ApiResponse(responseCode = "204", description = "No bid / declined / timeout")
+    })
     @PostMapping("/api/bid")
     public Mono<ResponseEntity<?>> bid(@RequestBody BidRequest request) {
         return biddingService.bid(request)
@@ -42,6 +50,8 @@ public class BidController {
                 });
     }
 
+    @Operation(summary = "Remaining budget")
+    @ApiResponse(responseCode = "200", description = "Current + per-creative budget")
     @GetMapping("/api/budget")
     public Mono<ResponseEntity<Map<String, Object>>> budget() {
         return Mono.zip(biddingService.getRemainingBudget(), biddingService.getRemainingBudgets())
@@ -51,6 +61,8 @@ public class BidController {
                 )));
     }
 
+    @Operation(summary = "Health check")
+    @ApiResponse(responseCode = "200", description = "Service is UP")
     @GetMapping("/health")
     public ResponseEntity<Map<String, String>> health() {
         return ResponseEntity.ok(Map.of("status", "UP"));
