@@ -4,7 +4,7 @@ Spring Boot bidder skeleton for Summer School 2026.
 
 ## What to implement
 
-Three areas are stubbed — look for `//  statusTODO` comments:
+Three areas are stubbed — look for `//  statushow dTODO` comments:
 
 | File | What to implement |
 |---|---|

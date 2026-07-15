@@ -53,21 +53,27 @@ public class AuctionNoticeConsumer {
             log.info("KAFKA  id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
 
             if (won) {
-                // TODO: handle win — record the win, decrement creative budget, update metrics
-                // Hints:
-                //   - ourBid.creativeId() / ourBid.bidPrice() is what we bid on this auction
-                //   - Call statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice())
-                //     (returns a Mono<Double>) and winNoticeRepository.save(...) (returns a
-                //     Mono<WinNotice>) — safe to .block() here, this listener runs on its own
-                //     dedicated Kafka consumer thread, not the Netty event loop
-                //   - Call metrics.recordWin(notice.getClearingPrice())
-                //   - Save a WinNotice via winNoticeRepository.save(...)
-                log.info("** WIN  id={} creative={} clearing={} — not yet handled",
-                        notice.getRequestId(), ourBid.creativeId(), notice.getClearingPrice());
+                double clearingPrice = notice.getClearingPrice();
+
+                // Decrement the winning creative's remaining budget in Redis (and sync
+                // Postgres's creatives.budget). Blocking is fine here — this Kafka consumer
+                // thread is not the Netty event loop.
+                statsCache.recordWin(ourBid.creativeId(), clearingPrice).block();
+
+                // Persist the win for reporting / durability.
+                winNoticeRepository.save(
+                        new WinNotice(notice.getRequestId(), properties.getId(),
+                                clearingPrice, ourBid.bidPrice())).block();
+
+                metrics.recordWin(clearingPrice);
+
+                log.info("** WIN  id={} creative={} clearing={} bid={}",
+                        notice.getRequestId(), ourBid.creativeId(), clearingPrice, ourBid.bidPrice());
             } else {
-                // TODO: handle loss — update metrics
-                // Hints:
-                //   - ourBid.bidPrice() is what we bid; call metrics.recordLoss()
+                metrics.recordLoss();
+
+                log.info("** LOSS id={} creative={} bid={}",
+                        notice.getRequestId(), ourBid.creativeId(), ourBid.bidPrice());
             }
         } catch (Exception e) {
             log.error("** KAFKA ERROR  failed to process auction notice: {}", e.getMessage());
