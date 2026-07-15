@@ -24,14 +24,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Random;
 
 @Service
 public class BiddingService {
 
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
-
-    private final Random random = new Random();
 
     private final BidderProperties properties;
     private final CreativeCache creativeCache;
@@ -89,34 +86,62 @@ public class BiddingService {
     }
 
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
-        // TODO: implement your bidding strategy
-        // Hints:
-        //   1. Record the request with buildRecord(request)
-        //   2. Find matching creatives with matchingCreatives(request, creativeCache.getAll())
-        //   3. Filter creatives whose maxBidPrice covers this floor: c.isWithinMaxBid(request.floorPrice())
-        //   4. Filter creatives that still have budget: statsCache.getRemainingBudget(c.getId()) > 0
-        //      (returns a Mono<Double> — flatMap/filterWhen into it)
-        //   5. Compute a bid price with computeBidPrice(request)
-        //   6. Record metrics: metrics.recordRequest(), metrics.recordBid(), metrics.recordNoBid(reason)
-        //   7. Call ownBidCache.record(requestId, creativeId, bidPrice) so AuctionNoticeConsumer
-        //      can look this bid up without a DB round trip
-        //   8. Save the BidRecord with bidRecordRepository.save(record) and return
-        //      Optional.of(new BidResponse(...)) or Optional.empty()
-        metrics.recordRequest();
-        metrics.recordNoBid("not_implemented");
-        BidRecord record = buildRecord(request);
-        record.setNoBidReason("not_implemented");
         long start = System.nanoTime();
-        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-        metrics.recordLatency(0);
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+        metrics.recordRequest();
+        BidRecord record = buildRecord(request);
+
+        // 1. Targeting match, 2. floor within the creative's max bid, 3. still has budget.
+        //    getRemainingBudget() is async (Mono<Double>) so the budget check uses filterWhen.
+        Flux<Creative> eligible = matchingCreatives(request, creativeCache.getAll())
+                .filter(c -> c.isWithinMaxBid(request.floorPrice()))
+                .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(remaining -> remaining > 0));
+
+        // Take the first eligible creative and bid on it; if none survive, no-bid.
+        return eligible.next()
+                .flatMap(creative -> {
+                    double bidPrice = computeBidPrice(request);
+                    record.setBidPrice(bidPrice);
+                    record.setCreativeId(creative.getId());
+                    metrics.recordBid();
+                    // Let AuctionNoticeConsumer resolve this bid from memory instead of hitting the DB.
+                    ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
+                    finish(record, start);
+                    BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
+                    return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                })
+                .switchIfEmpty(Mono.defer(() -> {
+                    String reason = "no_eligible_creative";
+                    record.setNoBidReason(reason);
+                    metrics.recordNoBid(reason);
+                    finish(record, start);
+                    return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+                }));
+    }
+
+    /** Stamp our processing latency onto the record and the timer metric. */
+    private void finish(BidRecord record, long startNanos) {
+        int latencyMs = (int) ((System.nanoTime() - startNanos) / 1_000_000);
+        record.setLatencyMs(latencyMs);
+        metrics.recordLatency(latencyMs);
     }
 
     private double computeBidPrice(BidRequest request) {
-        // TODO: implement your pricing strategy
-        // The bid must be above request.floorPrice().
-        // Use properties.getStrategy() for tuning parameters.
-        return request.floorPrice() * 1.01;
+        BidderProperties.Strategy s = properties.getStrategy();
+        double floor = request.floorPrice();
+
+        // Before we've seen enough wins to know the market, bid a fixed margin over floor
+        // (cold start). Once we have samples, anchor on the rolling average clearing price.
+        double bid;
+        if (statsCache.getSampleCount() < s.getMinSamples()) {
+            bid = floor * s.getColdStartMultiplier();
+        } else {
+            double market = statsCache.getRollingAverageWinPrice() * s.getMarketMultiplier();
+            // Never bid below the floor, even if the recent market has been cheap.
+            bid = Math.max(market, floor * s.getColdStartMultiplier());
+        }
+
+        // Guarantee the bid strictly clears the floor.
+        return Math.max(bid, floor * 1.01);
     }
 
     /** Total remaining budget across all this bidder's creatives. */
