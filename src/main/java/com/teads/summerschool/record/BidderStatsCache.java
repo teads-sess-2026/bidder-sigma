@@ -44,6 +44,12 @@ public class BidderStatsCache {
     private final CreativeRepository creativeRepository;
 
     private final AtomicLong winCount = new AtomicLong(0);
+    // Total auctions we've observed a clearing price for (wins + losses). Used as the sample count
+    // so the anchor switches from cold-start to the market average once we've seen enough of EITHER.
+    private final AtomicLong observationCount = new AtomicLong(0);
+    // Rolling window of observed clearing prices, fed by BOTH wins (what we paid) and losses (what
+    // the winner paid). Anchoring on this de-biased window lets the bid climb back when the market
+    // moves above us, instead of staying frozen at the cheap prices we won early.
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
@@ -81,13 +87,47 @@ public class BidderStatsCache {
                         .thenReturn(after))
                 .doOnNext(after -> {
                     winCount.incrementAndGet();
-                    synchronized (recentWinPrices) {
-                        recentWinPrices.addLast(clearingPrice);
-                        if (recentWinPrices.size() > properties.getStrategy().getWindowSize()) {
-                            recentWinPrices.pollFirst();
-                        }
-                    }
+                    // A win records exactly what we paid — no outlier clamp needed (it's bounded
+                    // by our own bid, which is already clamped to the creative's cap).
+                    pushClearingPrice(clearingPrice);
                 });
+    }
+
+    /**
+     * Feed the clearing price of an auction we LOST into the market window. A loss tells us the
+     * winner paid {@code clearingPrice} — the level we failed to beat — so recording it lets the
+     * anchor climb back up when the market moves above us, instead of staying frozen at the cheap
+     * prices we won early (survivorship bias).
+     *
+     * <p>Guard against outliers: in a first-price auction the clearing price is the winner's raw
+     * bid, so a single fat-finger overbid could be many times the real market level. Anything above
+     * {@code average × marketOutlierMultiplier} is clamped to that ceiling before entering the
+     * window, so one crazy-high winning bid can't drag our anchor up and make us overpay too. Before
+     * we have any samples there's nothing to compare against, so the first prices are taken as-is.
+     */
+    public void recordMarketPrice(double clearingPrice) {
+        if (clearingPrice <= 0) return;
+        double avg = getRollingAverageWinPrice();
+        double capped = clearingPrice;
+        if (avg > 0) {
+            double ceiling = avg * properties.getStrategy().getMarketOutlierMultiplier();
+            if (capped > ceiling) {
+                log.debug("MARKET  clamping outlier loss price {} to ceiling {}", clearingPrice, ceiling);
+                capped = ceiling;
+            }
+        }
+        pushClearingPrice(capped);
+    }
+
+    /** Append one price to the rolling market window, trimming to the configured window size. */
+    private void pushClearingPrice(double price) {
+        observationCount.incrementAndGet();
+        synchronized (recentWinPrices) {
+            recentWinPrices.addLast(price);
+            if (recentWinPrices.size() > properties.getStrategy().getWindowSize()) {
+                recentWinPrices.pollFirst();
+            }
+        }
     }
 
     /**
@@ -155,6 +195,6 @@ public class BidderStatsCache {
     }
 
     public long getSampleCount() {
-        return winCount.get();
+        return observationCount.get();
     }
 }

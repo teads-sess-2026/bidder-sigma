@@ -42,6 +42,11 @@ public class BidderProperties {
         // eta: step size of the λ update; lambdaMax: cap on the pacing multiplier.
         private double pacingEta = 0.5;
         private double pacingLambdaMax = 4.0;
+        // A loss clearing price above (current rolling average × this) is treated as an outlier
+        // (e.g. a competitor's fat-finger overbid) and clamped to that ceiling before it enters
+        // the market window — so one crazy-high winning bid can't drag our anchor up and make us
+        // overpay. See BidderStatsCache.recordMarketPrice.
+        private double marketOutlierMultiplier = 3.0;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -69,6 +74,9 @@ public class BidderProperties {
 
         public double getPacingLambdaMax() { return pacingLambdaMax; }
         public void setPacingLambdaMax(double pacingLambdaMax) { this.pacingLambdaMax = pacingLambdaMax; }
+
+        public double getMarketOutlierMultiplier() { return marketOutlierMultiplier; }
+        public void setMarketOutlierMultiplier(double marketOutlierMultiplier) { this.marketOutlierMultiplier = marketOutlierMultiplier; }
     }
 
     public static class Competition {

@@ -79,12 +79,18 @@ public class AuctionNoticeConsumer {
             } else {
                 metrics.recordLoss();
 
+                // Learn from the loss: the winner paid notice.getClearingPrice() — the level we
+                // failed to beat. Feed it into the market window so our bid anchor climbs back up
+                // when competitors move above us, instead of staying frozen at the cheap prices we
+                // won early. (recordMarketPrice clamps fat-finger outliers.)
+                statsCache.recordMarketPrice(notice.getClearingPrice());
+
                 // Adaptive pacing: we paid nothing this auction (lost) — step λ down so we bid
                 // more aggressively next time.
                 pacing.onOutcome(0.0);
 
-                log.info("** LOSS id={} creative={} bid={}",
-                        notice.getRequestId(), ourBid.creativeId(), ourBid.bidPrice());
+                log.info("** LOSS id={} creative={} bid={} clearing={}",
+                        notice.getRequestId(), ourBid.creativeId(), ourBid.bidPrice(), notice.getClearingPrice());
             }
         } catch (Exception e) {
             log.error("** KAFKA ERROR  failed to process auction notice: {}", e.getMessage());
