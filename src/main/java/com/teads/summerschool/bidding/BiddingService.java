@@ -90,32 +90,63 @@ public class BiddingService {
         metrics.recordRequest();
         BidRecord record = buildRecord(request);
 
-        // 1. Targeting match, 2. floor within the creative's max bid, 3. still has budget.
-        //    getRemainingBudget() is async (Mono<Double>) so the budget check uses filterWhen.
-        Flux<Creative> eligible = matchingCreatives(request, creativeCache.getAll())
-                .filter(c -> c.isWithinMaxBid(request.floorPrice()))
-                .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(remaining -> remaining > 0));
+        // Funnel the catalog through the eligibility filters in the order F3 mandates —
+        // 1. floor within the creative's max bid (checked before targeting and budget),
+        // 2. targeting match, 3. still has budget (async, so via filterWhen). Keeping the
+        // survivors of each stage lets us attribute an accurate no_bid_reason: whichever
+        // stage emptied the funnel is the reason we didn't bid.
+        return creativeCache.getAll().collectList().flatMap(all -> {
+            List<Creative> withinCap = all.stream()
+                    .filter(c -> c.isWithinMaxBid(request.floorPrice()))
+                    .toList();
+            List<Creative> matching = withinCap.stream()
+                    .filter(c -> c.matches(
+                            request.targeting().geo(),
+                            request.targeting().deviceType(),
+                            request.targeting().audienceSegment()))
+                    .toList();
 
-        // Take the first eligible creative and bid on it; if none survive, no-bid.
-        return eligible.next()
-                .flatMap(creative -> {
-                    double bidPrice = computeBidPrice(request);
-                    record.setBidPrice(bidPrice);
-                    record.setCreativeId(creative.getId());
-                    metrics.recordBid();
-                    // Let AuctionNoticeConsumer resolve this bid from memory instead of hitting the DB.
-                    ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
-                    finish(record, start);
-                    BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
-                    return bidRecordRepository.save(record).thenReturn(Optional.of(response));
-                })
-                .switchIfEmpty(Mono.defer(() -> {
-                    String reason = "no_eligible_creative";
-                    record.setNoBidReason(reason);
-                    metrics.recordNoBid(reason);
-                    finish(record, start);
-                    return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
-                }));
+            Flux<Creative> eligible = Flux.fromIterable(matching)
+                    .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(remaining -> remaining > 0));
+
+            // Take the first eligible creative and bid on it; if none survive, no-bid.
+            return eligible.next()
+                    .flatMap(creative -> {
+                        double bidPrice = computeBidPrice(request);
+                        record.setBidPrice(bidPrice);
+                        record.setCreativeId(creative.getId());
+                        metrics.recordBid();
+                        // Let AuctionNoticeConsumer resolve this bid from memory instead of hitting the DB.
+                        ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
+                        finish(record, start);
+                        BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
+                        return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                    })
+                    .switchIfEmpty(Mono.defer(() -> {
+                        String reason = noBidReason(all, withinCap, matching);
+                        record.setNoBidReason(reason);
+                        metrics.recordNoBid(reason);
+                        finish(record, start);
+                        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+                    }));
+        });
+    }
+
+    /**
+     * Attribute a no-bid to the eligibility stage that emptied the funnel, checked in F3's
+     * precedence order (cap, then targeting, then budget):
+     * <ul>
+     *   <li>{@code budget_exhausted} — creatives matched cap and targeting but all are out of budget</li>
+     *   <li>{@code targeting_miss} — creatives passed the cap but none matched the request's targeting</li>
+     *   <li>{@code floor_exceeds_max_bid} — creatives exist but the floor is above every one's cap</li>
+     *   <li>{@code no_eligible_creative} — the catalog is empty</li>
+     * </ul>
+     */
+    private String noBidReason(List<Creative> all, List<Creative> withinCap, List<Creative> matching) {
+        if (!matching.isEmpty()) return "budget_exhausted";
+        if (!withinCap.isEmpty()) return "targeting_miss";
+        if (!all.isEmpty()) return "floor_exceeds_max_bid";
+        return "no_eligible_creative";
     }
 
     /** Stamp our processing latency onto the record and the timer metric. */
@@ -156,13 +187,6 @@ public class BiddingService {
         return creativeCache.getAll()
                 .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
                 .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
-    }
-
-    private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
-        return all.filter(c -> c.matches(
-                        request.targeting().geo(),
-                        request.targeting().deviceType(),
-                        request.targeting().audienceSegment()));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {
