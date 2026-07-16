@@ -132,6 +132,15 @@ public class BiddingService {
                 Creative creative = selectBestCreative(eligible);
                 double bidPrice = computeBidPrice(request, creative);
 
+                // Only bid if the money left on this creative can actually cover the bid.
+                // budget > 0 above just means "some money left"; here we make sure it's
+                // enough to pay the price we're about to commit to, so a nearly-exhausted
+                // creative can't win an impression it can't afford and overspend its budget.
+                double remaining = budgets.getOrDefault(creative.getId(), 0.0);
+                if (bidPrice > remaining) {
+                    return noBid(record, "budget_below_bid", start);
+                }
+
                 record.setBidPrice(bidPrice);
                 record.setCreativeId(creative.getId());
                 metrics.recordBid();
