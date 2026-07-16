@@ -1,11 +1,9 @@
 package com.teads.summerschool.record;
 
 import com.teads.summerschool.config.BidderProperties;
-import com.teads.summerschool.creative.CreativeRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
-import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
@@ -18,30 +16,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * Per-creative budget cache backed by Redis.
  *
  * <p>Key format: {@code {bidderId}_{creativeId}_budget}, value = remaining budget.
- * Each creative has its own budget limit; remaining decreases on each Kafka-confirmed
- * win for that creative. Both this bidder and the SSP read these keys to decide whether
- * a creative can still spend. Postgres's {@code creatives.budget} column is kept in sync
- * with the same remaining value so it isn't lost if Redis is wiped.
+ * The SSP is the single owner of budget spend: it atomically decrements these keys on
+ * each win. This bidder never writes spend — it only seeds keys once with SETNX
+ * ({@code setIfAbsent}, so a bidder restart can't refill an already-spent budget) and
+ * reads them to decide whether a creative can still spend.
  */
 @Component
 public class BidderStatsCache {
 
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
-    // KEYS[1] = budget key, ARGV[1] = default budget (used only if the key doesn't exist yet),
-    // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
-    // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
-    // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
-            if redis.call('EXISTS', KEYS[1]) == 0 then
-                redis.call('SET', KEYS[1], ARGV[1])
-            end
-            return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
-            """, Double.class);
-
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
-    private final CreativeRepository creativeRepository;
 
     private final AtomicLong winCount = new AtomicLong(0);
     // Total auctions we've observed a clearing price for (wins + losses). Used as the sample count
@@ -52,11 +38,9 @@ public class BidderStatsCache {
     // moves above us, instead of staying frozen at the cheap prices we won early.
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
-    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
-                             CreativeRepository creativeRepository) {
+    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis) {
         this.properties = properties;
         this.redis = redis;
-        this.creativeRepository = creativeRepository;
     }
 
     /** Redis key holding the remaining budget for one creative. */
@@ -64,33 +48,33 @@ public class BidderStatsCache {
         return properties.getId() + "_" + creativeId + "_budget";
     }
 
-    /** Set a creative's remaining budget to its full limit. Called once per creative on startup. */
+    /**
+     * Seed a creative's remaining budget with its full limit, only if the key doesn't exist yet
+     * (SETNX). The SSP owns spend on these keys, so a bidder restart must NOT refill an
+     * already-spent budget. Called once per creative on startup.
+     */
     public Mono<Boolean> initBudget(String creativeId, double budget) {
         String key = budgetKey(creativeId);
-        return redis.opsForValue().set(key, String.valueOf(budget))
-                .doOnNext(ok -> log.info("Creative budget initialized: {} = {}", key, budget));
+        return redis.opsForValue().setIfAbsent(key, String.valueOf(budget))
+                .doOnNext(seeded -> {
+                    if (Boolean.TRUE.equals(seeded)) {
+                        log.info("Creative budget seeded: {} = {}", key, budget);
+                    } else {
+                        log.info("Creative budget already exists, left untouched: {}", key);
+                    }
+                });
     }
 
-    /** Decrement the winning creative's remaining budget by what it paid. */
-    public Mono<Double> recordWin(String creativeId, double clearingPrice) {
-        String key = budgetKey(creativeId);
-        return redis.execute(RECORD_WIN_SCRIPT,
-                        List.of(key),
-                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
-                .next()
-                .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
-                .flatMap(after -> creativeRepository.findById(creativeId)
-                        .flatMap(c -> {
-                            c.setBudget(after);
-                            return creativeRepository.save(c);
-                        })
-                        .thenReturn(after))
-                .doOnNext(after -> {
-                    winCount.incrementAndGet();
-                    // A win records exactly what we paid — no outlier clamp needed (it's bounded
-                    // by our own bid, which is already clamped to the creative's cap).
-                    pushClearingPrice(clearingPrice);
-                });
+    /**
+     * Record a Kafka-confirmed win in the local statistics (win count + rolling clearing-price
+     * window). The budget key itself is NOT touched here — the SSP is the single owner of budget
+     * spend and decrements it atomically on each win.
+     */
+    public void recordWin(String creativeId, double clearingPrice) {
+        winCount.incrementAndGet();
+        // A win records exactly what we paid — no outlier clamp needed (it's bounded
+        // by our own bid, which is already clamped to the creative's cap).
+        pushClearingPrice(clearingPrice);
     }
 
     /**
@@ -139,8 +123,8 @@ public class BidderStatsCache {
      *
      * <p>A missing key reads back as null here and is treated as the default creative budget
      * (matching {@link #getRemainingBudget}'s lazy-init semantics), but WITHOUT writing it back —
-     * the first real win will SET it via the atomic record-win script. Returns a map keyed by
-     * creativeId in the same order as the input.
+     * the next {@link #getRemainingBudget} call will lazy-seed it via setIfAbsent. Returns a map
+     * keyed by creativeId in the same order as the input.
      */
     public Mono<java.util.Map<String, Double>> getRemainingBudgets(List<String> creativeIds) {
         if (creativeIds.isEmpty()) {

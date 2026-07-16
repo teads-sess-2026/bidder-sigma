@@ -15,14 +15,14 @@ import java.util.List;
  *
  * <p>Originally read straight from Postgres on every bid() to stay correct, since creatives
  * can be added/removed after startup. But findByBidderId() runs on the bid hot path — a
- * ~200-row SELECT per request — and that table is also written by every Kafka-confirmed win
- * (BidderStatsCache.recordWin syncs creatives.budget), so it bloats under MVCC and the scan
- * slows over a run. On the shared, size-capped R2DBC pool that read both queues for a
+ * ~200-row SELECT per request — and historically that table was also written by every
+ * Kafka-confirmed win (recordWin used to sync creatives.budget), so it bloated under MVCC and
+ * the scan slowed over a run. On the shared, size-capped R2DBC pool that read both queues for a
  * connection and blows the bid deadline, surfacing as 204 no-bids near the end of a run.
  *
  * <p>The catalog's biddable attributes (targeting, maxBidPrice, metadata) are immutable during
- * a run; only the budget column changes, and the bid path reads budget from Redis, not from the
- * cached Creative. So a snapshot is safe. It's refreshed on the write path ({@link #refresh()},
+ * a run; remaining budget lives in Redis (owned and decremented by the SSP), and the bid path
+ * reads it from there, not from the cached Creative. So a snapshot is safe. It's refreshed on the write path ({@link #refresh()},
  * called by CreativeSeeder) and, as a safety net for creatives added/removed externally on the
  * shared Postgres mid-run, re-loaded by a low-frequency background poll — invalidation by the
  * write path plus a slow poll, not a per-request read.

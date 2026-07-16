@@ -66,7 +66,7 @@ public class CreativeSeeder implements ApplicationRunner {
                 .thenMany(repository.findByBidderId(id))
                 .flatMap(c -> statsCache.initBudget(c.getId(), c.getBudget())
                         .onErrorResume(e -> {
-                            log.warn("Failed to init budget for creative {} — will lazy-init on first read/win: {}",
+                            log.warn("Failed to seed budget for creative {} — will lazy-seed on first read: {}",
                                     c.getId(), e.getMessage());
                             return Mono.empty();
                         }))

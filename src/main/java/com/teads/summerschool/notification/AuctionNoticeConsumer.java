@@ -59,11 +59,6 @@ public class AuctionNoticeConsumer {
             if (won) {
                 double clearingPrice = notice.getClearingPrice();
 
-                // Decrement the winning creative's remaining budget in Redis (and sync
-                // Postgres's creatives.budget). Blocking is fine here — this Kafka consumer
-                // thread is not the Netty event loop.
-                statsCache.recordWin(ourBid.creativeId(), clearingPrice).block();
-
                 // Persist the win for reporting / durability.
                 winNoticeRepository.save(
                         new WinNotice(notice.getRequestId(), properties.getId(),
