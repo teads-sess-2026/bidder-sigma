@@ -73,7 +73,7 @@ public class StatsService {
         double avgWinPrice = wins.stream().mapToDouble(WinNotice::getClearingPrice).average().orElse(0.0);
         double totalSpend = wins.stream().mapToDouble(WinNotice::getClearingPrice).sum();
 
-        double budget = properties.getBudget();
+        double budget = properties.getCreativeBudget() * 200.0;
         double remainingBudget = Math.max(0.0, budget - totalSpend);
 
         double bidRate = totalAuctions > 0 ? (double) bids / totalAuctions : 0.0;
