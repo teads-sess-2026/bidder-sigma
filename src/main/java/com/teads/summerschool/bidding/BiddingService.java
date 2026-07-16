@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.Arrays;
@@ -99,7 +100,7 @@ public class BiddingService {
         // 2. targeting match, 3. still has budget (a single batched Redis MGET below). Keeping
         // the survivors of each stage lets us attribute an accurate no_bid_reason: whichever
         // stage emptied the funnel is the reason we didn't bid.
-        return creativeCache.getAll().collectList().flatMap(all -> {
+        return creativeCache.getAll().collectList().<Optional<BidResponse>>flatMap(all -> {
             List<Creative> withinCap = all.stream()
                     .filter(c -> c.isWithinMaxBid(request.floorPrice()))
                     .toList();
@@ -111,7 +112,7 @@ public class BiddingService {
                     .toList();
 
             if (matching.isEmpty()) {
-                return noBid(record, noBidReason(all, withinCap, matching), start);
+                return noBid(record, noBidReason(all, withinCap), start);
             }
 
             // Budget check for ALL matching creatives in a single Redis round trip (MGET), not
@@ -149,9 +150,37 @@ public class BiddingService {
                 ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
                 finish(record, start);
                 BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
-                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                // Persist off the response path: the record is for reporting/durability, not
+                // needed to answer this request, so don't make the bidder wait on the shared
+                // R2DBC pool to reply. Fire-and-forget on boundedElastic with error logging.
+                persistAsync(record);
+                return Mono.just(Optional.of(response));
             });
+        })
+        // Any failure in the chain (Redis timeout, DB acquire stall, etc.) becomes a fast no-bid,
+        // never a 5xx. The controller also bounds this, but attributing it here gives an accurate
+        // no-bid reason and a clean Optional.empty() instead of a bubbled error.
+        .timeout(Duration.ofMillis(properties.getTimeoutMs()))
+        .onErrorResume(ex -> {
+            log.warn("<< BID ERROR  id={} — {}: {}", request.requestId(),
+                    ex.getClass().getSimpleName(), ex.getMessage());
+            metrics.recordNoBid("internal_error");
+            return Mono.just(Optional.empty());
         });
+    }
+
+    /**
+     * Persist a bid record without blocking the response. Runs on boundedElastic (the R2DBC
+     * save may queue for a pooled connection) and logs on failure — a dropped record only
+     * costs reporting fidelity, never a returned bid.
+     */
+    private void persistAsync(BidRecord record) {
+        bidRecordRepository.save(record)
+                .subscribeOn(Schedulers.boundedElastic())
+                .subscribe(
+                        saved -> {},
+                        err -> log.warn("Failed to persist bid record id={}: {}",
+                                record.getRequestId(), err.getMessage()));
     }
 
     /** No-bid terminal: stamp the reason, record metrics + latency, persist, return empty. */
@@ -159,7 +188,11 @@ public class BiddingService {
         record.setNoBidReason(reason);
         metrics.recordNoBid(reason);
         finish(record, start);
-        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+        // Same as the bid path: persist off the response path so a slow DB write can't
+        // delay the 204. All no-bid records are kept (StatsService's bid-rate and no-bid-reason
+        // breakdowns depend on the full set), just written asynchronously.
+        persistAsync(record);
+        return Mono.just(Optional.empty());
     }
 
     /**
@@ -190,16 +223,16 @@ public class BiddingService {
 
     /**
      * Attribute a no-bid to the eligibility stage that emptied the funnel, checked in F3's
-     * precedence order (cap, then targeting, then budget):
+     * precedence order (cap, then targeting). Only called when {@code matching} is empty, so the
+     * funnel emptied at the cap or targeting stage — budget exhaustion is attributed inline at
+     * the budget check, not here:
      * <ul>
-     *   <li>{@code budget_exhausted} — creatives matched cap and targeting but all are out of budget</li>
      *   <li>{@code targeting_miss} — creatives passed the cap but none matched the request's targeting</li>
      *   <li>{@code floor_exceeds_max_bid} — creatives exist but the floor is above every one's cap</li>
      *   <li>{@code no_eligible_creative} — the catalog is empty</li>
      * </ul>
      */
-    private String noBidReason(List<Creative> all, List<Creative> withinCap, List<Creative> matching) {
-        if (!matching.isEmpty()) return "budget_exhausted";
+    private String noBidReason(List<Creative> all, List<Creative> withinCap) {
         if (!withinCap.isEmpty()) return "targeting_miss";
         if (!all.isEmpty()) return "floor_exceeds_max_bid";
         return "no_eligible_creative";
@@ -261,16 +294,21 @@ public class BiddingService {
 
     /** Total remaining budget across all this bidder's creatives. */
     public Mono<Double> getRemainingBudget() {
-        return creativeCache.getAll()
-                .flatMap(c -> statsCache.getRemainingBudget(c.getId()))
-                .reduce(0.0, Double::sum);
+        return getRemainingBudgets()
+                .map(m -> m.values().stream().mapToDouble(Double::doubleValue).sum());
     }
 
-    /** Remaining budget per creative id. */
+    /**
+     * Remaining budget per creative id, in one batched Redis round trip (MGET) instead of one
+     * GET per creative — the gauge supplier and /api/budget both poll this, and N serial Redis
+     * calls on the shared pool are what {@link #getRemainingBudgetSafe} was added to bound.
+     */
     public Mono<Map<String, Double>> getRemainingBudgets() {
         return creativeCache.getAll()
-                .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
-                .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
+                .map(Creative::getId)
+                .collectList()
+                .flatMap(ids -> statsCache.getRemainingBudgets(ids)
+                        .map(m -> new LinkedHashMap<String, Double>(m)));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {
