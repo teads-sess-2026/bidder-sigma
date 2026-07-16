@@ -90,6 +90,43 @@ public class BidderStatsCache {
                 });
     }
 
+    /**
+     * Remaining budget for several creatives in ONE Redis round trip (MGET), instead of a
+     * sequential get-per-creative. The bid hot path checks every eligible creative's budget
+     * under a tight (~50ms) Redis timeout inside an even tighter (~300ms) bid deadline; N
+     * sequential round trips on the shared Lettuce pool blow that budget and surface as
+     * RedisSystemException/timeouts (→ 204 no-bid). MGET makes it a single call regardless of N.
+     *
+     * <p>A missing key reads back as null here and is treated as the default creative budget
+     * (matching {@link #getRemainingBudget}'s lazy-init semantics), but WITHOUT writing it back —
+     * the first real win will SET it via the atomic record-win script. Returns a map keyed by
+     * creativeId in the same order as the input.
+     */
+    public Mono<java.util.Map<String, Double>> getRemainingBudgets(List<String> creativeIds) {
+        if (creativeIds.isEmpty()) {
+            return Mono.just(java.util.Map.of());
+        }
+        double defaultBudget = properties.getCreativeBudget();
+        List<String> keys = creativeIds.stream().map(this::budgetKey).toList();
+        return redis.opsForValue().multiGet(keys)
+                .map(values -> {
+                    java.util.Map<String, Double> out = new java.util.LinkedHashMap<>();
+                    for (int i = 0; i < creativeIds.size(); i++) {
+                        String raw = i < values.size() ? values.get(i) : null;
+                        double budget = defaultBudget;
+                        if (raw != null) {
+                            try {
+                                budget = Double.parseDouble(raw);
+                            } catch (NumberFormatException e) {
+                                budget = defaultBudget;
+                            }
+                        }
+                        out.put(creativeIds.get(i), budget);
+                    }
+                    return out;
+                });
+    }
+
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */
     public Mono<Double> getRemainingBudget(String creativeId) {
         String key = budgetKey(creativeId);

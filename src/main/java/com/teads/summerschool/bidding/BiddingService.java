@@ -15,7 +15,6 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
@@ -36,6 +35,7 @@ public class BiddingService {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
+    private final PacingController pacing;
 
     // Last successfully computed budget.remaining, served when a scrape's
     // computation times out instead of blocking the scrape thread forever.
@@ -46,18 +46,22 @@ public class BiddingService {
                           BidRecordRepository bidRecordRepository,
                           BidderStatsCache statsCache,
                           BidderMetrics metrics,
-                          OwnBidCache ownBidCache) {
+                          OwnBidCache ownBidCache,
+                          PacingController pacing) {
         this.properties = properties;
         this.creativeCache = creativeCache;
         this.bidRecordRepository = bidRecordRepository;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
+        this.pacing = pacing;
     }
 
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
+        // Expose the pacing multiplier so we can watch the controller react during a run.
+        metrics.registerGauge("pacing.lambda", pacing::getLambda);
     }
 
     /**
@@ -92,8 +96,8 @@ public class BiddingService {
 
         // Funnel the catalog through the eligibility filters in the order F3 mandates —
         // 1. floor within the creative's max bid (checked before targeting and budget),
-        // 2. targeting match, 3. still has budget (async, so via filterWhen). Keeping the
-        // survivors of each stage lets us attribute an accurate no_bid_reason: whichever
+        // 2. targeting match, 3. still has budget (a single batched Redis MGET below). Keeping
+        // the survivors of each stage lets us attribute an accurate no_bid_reason: whichever
         // stage emptied the funnel is the reason we didn't bid.
         return creativeCache.getAll().collectList().flatMap(all -> {
             List<Creative> withinCap = all.stream()
@@ -106,30 +110,73 @@ public class BiddingService {
                             request.targeting().audienceSegment()))
                     .toList();
 
-            Flux<Creative> eligible = Flux.fromIterable(matching)
-                    .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(remaining -> remaining > 0));
+            if (matching.isEmpty()) {
+                return noBid(record, noBidReason(all, withinCap, matching), start);
+            }
 
-            // Take the first eligible creative and bid on it; if none survive, no-bid.
-            return eligible.next()
-                    .flatMap(creative -> {
-                        double bidPrice = computeBidPrice(request);
-                        record.setBidPrice(bidPrice);
-                        record.setCreativeId(creative.getId());
-                        metrics.recordBid();
-                        // Let AuctionNoticeConsumer resolve this bid from memory instead of hitting the DB.
-                        ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
-                        finish(record, start);
-                        BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
-                        return bidRecordRepository.save(record).thenReturn(Optional.of(response));
-                    })
-                    .switchIfEmpty(Mono.defer(() -> {
-                        String reason = noBidReason(all, withinCap, matching);
-                        record.setNoBidReason(reason);
-                        metrics.recordNoBid(reason);
-                        finish(record, start);
-                        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
-                    }));
+            // Budget check for ALL matching creatives in a single Redis round trip (MGET), not
+            // one sequential get per creative — N serial calls on the shared Lettuce pool blow
+            // the ~50ms Redis / ~300ms bid deadline and surface as timeouts (204 no-bid).
+            List<String> ids = matching.stream().map(Creative::getId).toList();
+            return statsCache.getRemainingBudgets(ids).flatMap(budgets -> {
+                List<Creative> eligible = matching.stream()
+                        .filter(c -> budgets.getOrDefault(c.getId(), 0.0) > 0)
+                        .toList();
+                if (eligible.isEmpty()) {
+                    return noBid(record, "budget_exhausted", start);
+                }
+
+                // Pick the most specific creative (tie-break on the highest cap) rather than
+                // whichever the catalog happened to list first — a more targeted creative is
+                // the better match for this impression.
+                Creative creative = selectBestCreative(eligible);
+                double bidPrice = computeBidPrice(request, creative);
+
+                record.setBidPrice(bidPrice);
+                record.setCreativeId(creative.getId());
+                metrics.recordBid();
+                pacing.recordParticipation(all.size());
+                // Let AuctionNoticeConsumer resolve this bid from memory instead of hitting the DB.
+                ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
+                finish(record, start);
+                BidResponse response = new BidResponse(request.requestId(), bidPrice, toCreativeDto(creative));
+                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+            });
         });
+    }
+
+    /** No-bid terminal: stamp the reason, record metrics + latency, persist, return empty. */
+    private Mono<Optional<BidResponse>> noBid(BidRecord record, String reason, long start) {
+        record.setNoBidReason(reason);
+        metrics.recordNoBid(reason);
+        finish(record, start);
+        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+    }
+
+    /**
+     * Best creative among the budget-eligible survivors: most targeting dimensions constrained
+     * (higher specificity = better match for this impression), tie-broken by the highest cap.
+     */
+    private Creative selectBestCreative(List<Creative> creatives) {
+        return creatives.stream()
+                .max((a, b) -> {
+                    int specA = specificity(a);
+                    int specB = specificity(b);
+                    if (specA != specB) return Integer.compare(specA, specB);
+                    double capA = a.getMaxBidPrice() != null ? a.getMaxBidPrice() : 0.0;
+                    double capB = b.getMaxBidPrice() != null ? b.getMaxBidPrice() : 0.0;
+                    return Double.compare(capA, capB);
+                })
+                .orElseThrow(() -> new IllegalStateException("selectBestCreative called with empty list"));
+    }
+
+    /** Count of constrained targeting dimensions (0-3); higher = more specifically targeted. */
+    private int specificity(Creative c) {
+        int score = 0;
+        if (c.getAllowedGeos() != null && !c.getAllowedGeos().isBlank()) score++;
+        if (c.getAllowedDevices() != null && !c.getAllowedDevices().isBlank()) score++;
+        if (c.getAudienceSegments() != null && !c.getAudienceSegments().isBlank()) score++;
+        return score;
     }
 
     /**
@@ -156,23 +203,47 @@ public class BiddingService {
         metrics.recordLatency(latencyMs);
     }
 
-    private double computeBidPrice(BidRequest request) {
+    /**
+     * Bid price = per-impression <em>value</em>, shaded by the adaptive pacing multiplier λ, then
+     * constrained to clear the floor and respect the creative's cap.
+     *
+     * <p>Following Gaitonde et al.'s adaptive-pacing algorithm, the pacing-aware bid is
+     * {@code value / (1 + λ)}: bid true value when unconstrained (λ=0), shade proportionally as the
+     * dual variable rises to keep spend on budget. λ is stepped in {@link PacingController#onOutcome}
+     * off every observed win/loss — see {@link PacingController} and AuctionNoticeConsumer.
+     *
+     * <p>The value anchor is the creative's declared willingness-to-pay (its max cap) when set,
+     * otherwise the rolling market clearing price once we've seen enough wins, otherwise a fixed
+     * cold-start margin over the floor.
+     */
+    private double computeBidPrice(BidRequest request, Creative creative) {
         BidderProperties.Strategy s = properties.getStrategy();
         double floor = request.floorPrice();
 
-        // Before we've seen enough wins to know the market, bid a fixed margin over floor
-        // (cold start). Once we have samples, anchor on the rolling average clearing price.
-        double bid;
-        if (statsCache.getSampleCount() < s.getMinSamples()) {
-            bid = floor * s.getColdStartMultiplier();
+        double value;
+        if (creative.getMaxBidPrice() != null) {
+            value = creative.getMaxBidPrice();
+        } else if (statsCache.getSampleCount() >= s.getMinSamples()) {
+            value = statsCache.getRollingAverageWinPrice() * s.getMarketMultiplier();
         } else {
-            double market = statsCache.getRollingAverageWinPrice() * s.getMarketMultiplier();
-            // Never bid below the floor, even if the recent market has been cheap.
-            bid = Math.max(market, floor * s.getColdStartMultiplier());
+            value = floor * s.getColdStartMultiplier();
         }
+        // Value should never be below what it costs to clear the floor.
+        value = Math.max(value, floor * s.getColdStartMultiplier());
 
-        // Guarantee the bid strictly clears the floor.
-        return Math.max(bid, floor * 1.01);
+        // Adaptive pacing: shade value by the current dual multiplier λ.
+        double bid = value * pacing.shadeFactor();
+
+        return enforceConstraints(bid, floor, creative);
+    }
+
+    /** Clamp a raw bid: strictly clear the floor, never exceed the creative's cap. */
+    private double enforceConstraints(double bid, double floor, Creative creative) {
+        bid = Math.max(bid, floor * 1.01);
+        if (creative.getMaxBidPrice() != null) {
+            bid = Math.min(bid, creative.getMaxBidPrice());
+        }
+        return bid;
     }
 
     /** Total remaining budget across all this bidder's creatives. */

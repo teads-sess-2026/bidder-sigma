@@ -1,5 +1,6 @@
 package com.teads.summerschool.notification;
 
+import com.teads.summerschool.bidding.PacingController;
 import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.metrics.BidderMetrics;
 import com.teads.summerschool.proto.AuctionNoticeProto;
@@ -20,17 +21,20 @@ public class AuctionNoticeConsumer {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
+    private final PacingController pacing;
 
     public AuctionNoticeConsumer(WinNoticeRepository winNoticeRepository,
                                  BidderProperties properties,
                                  BidderStatsCache statsCache,
                                  BidderMetrics metrics,
-                                 OwnBidCache ownBidCache) {
+                                 OwnBidCache ownBidCache,
+                                 PacingController pacing) {
         this.winNoticeRepository = winNoticeRepository;
         this.properties = properties;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
+        this.pacing = pacing;
     }
 
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
@@ -67,10 +71,17 @@ public class AuctionNoticeConsumer {
 
                 metrics.recordWin(clearingPrice);
 
+                // Adaptive pacing: we spent `clearingPrice` this auction — step λ toward budget.
+                pacing.onOutcome(clearingPrice);
+
                 log.info("** WIN  id={} creative={} clearing={} bid={}",
                         notice.getRequestId(), ourBid.creativeId(), clearingPrice, ourBid.bidPrice());
             } else {
                 metrics.recordLoss();
+
+                // Adaptive pacing: we paid nothing this auction (lost) — step λ down so we bid
+                // more aggressively next time.
+                pacing.onOutcome(0.0);
 
                 log.info("** LOSS id={} creative={} bid={}",
                         notice.getRequestId(), ourBid.creativeId(), ourBid.bidPrice());

@@ -9,7 +9,10 @@
       "Read(//tmp/**)",
       "Bash(unzip -q -o mvn.zip)",
       "Bash(/tmp/apache-maven-3.9.15/bin/mvn -v)",
-      "Bash(/tmp/apache-maven-3.9.15/bin/mvn -q compile)"
+      "Bash(/tmp/apache-maven-3.9.15/bin/mvn -q compile)",
+      "Bash(mvn -version)",
+      "Bash(javac -version)",
+      "Read(//Users/janze/.m2/repository/**)"
     ]
   }
 }

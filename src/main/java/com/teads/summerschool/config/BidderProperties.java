@@ -38,6 +38,10 @@ public class BidderProperties {
         private double premiumMultiplier = 1.5;
         private double pacingBoost = 1.20;
         private double pacingCut = 0.85;
+        // Adaptive-pacing (dual gradient) knobs — see PacingController.
+        // eta: step size of the λ update; lambdaMax: cap on the pacing multiplier.
+        private double pacingEta = 0.5;
+        private double pacingLambdaMax = 4.0;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -59,6 +63,12 @@ public class BidderProperties {
 
         public double getPacingCut() { return pacingCut; }
         public void setPacingCut(double pacingCut) { this.pacingCut = pacingCut; }
+
+        public double getPacingEta() { return pacingEta; }
+        public void setPacingEta(double pacingEta) { this.pacingEta = pacingEta; }
+
+        public double getPacingLambdaMax() { return pacingLambdaMax; }
+        public void setPacingLambdaMax(double pacingLambdaMax) { this.pacingLambdaMax = pacingLambdaMax; }
     }
 
     public static class Competition {
