@@ -213,36 +213,40 @@ public class BiddingService {
     }
 
     /**
-     * Bid price = per-impression <em>value</em>, shaded by the adaptive pacing multiplier λ, then
-     * constrained to clear the floor and respect the creative's cap.
+     * Bid price = just enough to win the auction, NOT our full cap. We anchor on the market's
+     * recent clearing price plus a small margin, treating the creative's cap only as a ceiling.
      *
-     * <p>Following Gaitonde et al.'s adaptive-pacing algorithm, the pacing-aware bid is
-     * {@code value / (1 + λ)}: bid true value when unconstrained (λ=0), shade proportionally as the
-     * dual variable rises to keep spend on budget. λ is stepped in {@link PacingController#onOutcome}
-     * off every observed win/loss — see {@link PacingController} and AuctionNoticeConsumer.
+     * <p>Why not bid the full cap: in a first-price auction you pay exactly what you bid, and the
+     * market here clears close to the floor (competitors win bidding only ~1.05–1.20× floor). Bidding
+     * our full $1.50–$5.00 cap would win auctions but grossly overpay, so our per-creative budget
+     * buys far fewer total wins than a bidder that pays just above the clearing price. The goal is to
+     * win the auctions worth winning without leaving money on the table.
      *
-     * <p>The value anchor is the creative's declared willingness-to-pay (its max cap) when set,
-     * otherwise the rolling market clearing price once we've seen enough wins, otherwise a fixed
-     * cold-start margin over the floor.
+     * <p>The bid anchor, in order:
+     * <ul>
+     *   <li>Once we've seen enough wins ({@code minSamples}), the rolling average clearing price times
+     *       a small {@code marketMultiplier} margin — bid just over what the market has been paying.</li>
+     *   <li>Before that (cold start), a fixed {@code coldStartMultiplier} margin over the floor.</li>
+     * </ul>
+     * In both cases we keep at least the cold-start margin over the floor, and {@link #enforceConstraints}
+     * clamps the result to strictly clear the floor and never exceed the creative's cap.
      */
     private double computeBidPrice(BidRequest request, Creative creative) {
         BidderProperties.Strategy s = properties.getStrategy();
         double floor = request.floorPrice();
 
-        double value;
-        if (creative.getMaxBidPrice() != null) {
-            value = creative.getMaxBidPrice();
-        } else if (statsCache.getSampleCount() >= s.getMinSamples()) {
-            value = statsCache.getRollingAverageWinPrice() * s.getMarketMultiplier();
+        double bid;
+        if (statsCache.getSampleCount() >= s.getMinSamples()) {
+            // Bid just above the market's recent clearing price — enough to win, not the full cap.
+            bid = statsCache.getRollingAverageWinPrice() * s.getMarketMultiplier();
         } else {
-            value = floor * s.getColdStartMultiplier();
+            // Cold start (no market signal yet): a small fixed margin over the floor.
+            bid = floor * s.getColdStartMultiplier();
         }
-        // Value should never be below what it costs to clear the floor.
-        value = Math.max(value, floor * s.getColdStartMultiplier());
+        // Never bid below what it takes to clear the floor with our cold-start margin.
+        bid = Math.max(bid, floor * s.getColdStartMultiplier());
 
-        // Adaptive pacing: shade value by the current dual multiplier λ.
-        double bid = value * pacing.shadeFactor();
-
+        // enforceConstraints caps this at the creative's max bid, so the cap is a ceiling, not a target.
         return enforceConstraints(bid, floor, creative);
     }
 

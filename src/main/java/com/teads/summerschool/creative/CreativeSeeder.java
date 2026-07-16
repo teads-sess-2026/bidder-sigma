@@ -28,8 +28,12 @@ public class CreativeSeeder implements ApplicationRunner {
 
     private static final int    CREATIVE_COUNT    = 200;
     private static final long   SEED              = 42;
-    private static final double MAX_BID_PRICE_MIN = 0.05;
-    private static final double MAX_BID_PRICE_MAX = 0.30;
+    // Cap = the highest floor a creative will pay. The old $0.05–$0.30 range sat below typical
+    // floors (the API example floor is $1.00), so isWithinMaxBid rejected creatives before we
+    // could bid. Raise it to clear realistic floors with headroom so "bid hard" can actually win.
+    // Tune against the real floors observed in bid_record if the market runs higher/lower.
+    private static final double MAX_BID_PRICE_MIN = 1.50;
+    private static final double MAX_BID_PRICE_MAX = 5.00;
 
     private final CreativeRepository repository;
     private final BidderProperties   properties;
