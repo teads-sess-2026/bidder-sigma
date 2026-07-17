@@ -1,6 +1,7 @@
 package com.teads.summerschool.record;
 
 import com.teads.summerschool.config.BidderProperties;
+import com.teads.summerschool.metrics.BidderMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
@@ -28,6 +29,7 @@ public class BidderStatsCache {
 
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
+    private final BidderMetrics metrics;
 
     private final AtomicLong winCount = new AtomicLong(0);
     // Total auctions we've observed a clearing price for (wins + losses). Used as the sample count
@@ -38,9 +40,11 @@ public class BidderStatsCache {
     // moves above us, instead of staying frozen at the cheap prices we won early.
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
-    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis) {
+    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
+                             BidderMetrics metrics) {
         this.properties = properties;
         this.redis = redis;
+        this.metrics = metrics;
     }
 
     /** Redis key holding the remaining budget for one creative. */
@@ -135,6 +139,7 @@ public class BidderStatsCache {
         return redis.opsForValue().multiGet(keys)
                 .map(values -> {
                     java.util.Map<String, Double> out = new java.util.LinkedHashMap<>();
+                    int missing = 0;
                     for (int i = 0; i < creativeIds.size(); i++) {
                         String raw = i < values.size() ? values.get(i) : null;
                         double budget = defaultBudget;
@@ -144,8 +149,19 @@ public class BidderStatsCache {
                             } catch (NumberFormatException e) {
                                 budget = defaultBudget;
                             }
+                        } else {
+                            missing++;
                         }
                         out.put(creativeIds.get(i), budget);
+                    }
+                    // Count missing keys for observability, but deliberately do NOT re-seed them
+                    // here: if the SSP deletes an exhausted budget key, re-seeding to the default
+                    // would refill money the creative already spent. The map already carries the
+                    // default for this bid; a rising counter tells us whether keys are disappearing.
+                    if (missing > 0) {
+                        metrics.recordBudgetKeyMissing(missing);
+                        log.warn("BUDGET  {} of {} budget keys missing from Redis (treated as default {})",
+                                missing, keys.size(), defaultBudget);
                     }
                     return out;
                 });

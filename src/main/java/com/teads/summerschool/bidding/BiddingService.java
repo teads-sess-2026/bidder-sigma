@@ -181,8 +181,28 @@ public class BiddingService {
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(
                         saved -> {},
-                        err -> log.warn("Failed to persist bid record id={}: {}",
-                                record.getRequestId(), err.getMessage()));
+                        err -> {
+                            // Tag the cause so Prometheus proves whether persist loss is the SSP
+                            // re-sending a request_id (duplicate key on bid_record's unique
+                            // request_id constraint) versus pool/timeout failures. A dropped record
+                            // only costs reporting fidelity — the bid response already went out.
+                            String cause = isDuplicateKey(err) ? "duplicate_key" : "other";
+                            metrics.recordPersistFailure(cause);
+                            log.warn("Failed to persist bid record id={} ({}): {}",
+                                    record.getRequestId(), cause, err.getMessage());
+                        });
+    }
+
+    /** True if the failure is a unique-constraint violation (duplicate request_id re-sent by the SSP). */
+    private boolean isDuplicateKey(Throwable err) {
+        for (Throwable t = err; t != null; t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("duplicate key value") || msg.contains("uk_bid_record_request_id"))) {
+                return true;
+            }
+            if (t.getCause() == t) break;
+        }
+        return false;
     }
 
     /** No-bid terminal: stamp the reason, record metrics + latency, persist, return empty. */

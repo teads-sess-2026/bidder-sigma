@@ -56,6 +56,21 @@ public class BidderMetrics {
         registry.counter(prefix + "nobids", "reason", reason == null ? "unknown" : reason).increment();
     }
 
+    /**
+     * Count budget keys that came back missing from Redis on a batched read (MGET).
+     */
+    public void recordBudgetKeyMissing(long count) {
+        if (count <= 0) return;
+        registry.counter(prefix + "budget_key_missing").increment(count);
+    }
+
+    /**
+     * Count failures to persist a bid record, tagged by cause.
+     */
+    public void recordPersistFailure(String cause) {
+        registry.counter(prefix + "persist_failures", "cause", cause == null ? "other" : cause).increment();
+    }
+
     public void recordLatency(long ms) { bidLatency.record(ms, TimeUnit.MILLISECONDS); }
 
     public void recordWin(double clearingPrice) {
