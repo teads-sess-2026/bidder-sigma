@@ -1,4 +1,4 @@
-# SESS-Frontend
+# SESS-Frontend SIGMA
 
 A starter dashboard that connects to a bidder's **Stats API** and displays its performance
 (overview KPIs, per-creative breakdown, targeting results, and recent trends). Fork this repo
