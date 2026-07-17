@@ -47,12 +47,6 @@ public class BidderProperties {
         // the market window — so one crazy-high winning bid can't drag our anchor up and make us
         // overpay. See BidderStatsCache.recordMarketPrice.
         private double marketOutlierMultiplier = 3.0;
-        // Time-based catch-up: when actual spend lags the linear pace (elapsed/duration of the
-        // total budget), bids are scaled up toward the creative cap so leftover budget gets spent
-        // before the deadline instead of finishing the run under budget. This is the maximum
-        // multiplier applied when we're badly behind; enforceConstraints still clamps to the cap.
-        // See PacingController.catchUpFactor.
-        private double catchUpMax = 3.0;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -83,9 +77,6 @@ public class BidderProperties {
 
         public double getMarketOutlierMultiplier() { return marketOutlierMultiplier; }
         public void setMarketOutlierMultiplier(double marketOutlierMultiplier) { this.marketOutlierMultiplier = marketOutlierMultiplier; }
-
-        public double getCatchUpMax() { return catchUpMax; }
-        public void setCatchUpMax(double catchUpMax) { this.catchUpMax = catchUpMax; }
     }
 
     public static class Competition {

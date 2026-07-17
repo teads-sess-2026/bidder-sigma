@@ -48,11 +48,6 @@ public class PacingController {
     // Auctions we have actually bid in, used to estimate the total horizon T live.
     private final AtomicLong participations = new AtomicLong(0);
 
-    // Actual spend so far, in cents (clearing price summed over every auction we won). Compared
-    // against the linear-pace target in catchUpFactor to scale bids up when we fall behind. Cents
-    // (long) so the running total is exact and lock-free — see onOutcome.
-    private final AtomicLong spentCents = new AtomicLong(0);
-
     // Total budget B across all our creatives. Budget is tracked per creative (flat
     // creativeBudget each), so B = creativeBudget * catalog size. The catalog can change at
     // runtime, so BiddingService refreshes this from the size it already collected per bid.
@@ -86,39 +81,6 @@ public class PacingController {
     }
 
     /**
-     * Bid multiplier that scales up when actual spend lags the linear pace, so leftover budget gets
-     * spent before the deadline instead of finishing the run under budget (the failure mode where we
-     * win cheaply the whole way and end with money unspent).
-     *
-     * <p>Let {@code target = totalBudget · elapsed/duration} be the linear-pace spend for right now,
-     * and {@code actual} our cumulative spend. The factor is {@code target / actual}, clipped to
-     * {@code [1, catchUpMax]}: on or ahead of pace → 1.0 (no boost); behind → up to {@code catchUpMax}.
-     * {@link #computeBidPrice} multiplies the anchor by this and {@code enforceConstraints} clamps the
-     * result to the creative cap, so catch-up can raise bids toward the cap but never past it.
-     *
-     * <p>Returns 1.0 until the clock is running and we've spent something, so it never divides by
-     * zero and never boosts before there's a pace to fall behind.
-     */
-    public double catchUpFactor() {
-        Instant s = start;
-        long durationSec = properties.getCompetition().getDurationSeconds();
-        double actual = spentCents.get() / 100.0;
-        if (s == null || durationSec <= 0 || actual <= 0) {
-            return 1.0;
-        }
-        double elapsedSec = Duration.between(s, Instant.now()).toMillis() / 1000.0;
-        // Fraction of the window elapsed, clamped to [0, 1] — past the deadline we still want the
-        // full-budget target, not an ever-growing one.
-        double fraction = Math.min(1.0, Math.max(0.0, elapsedSec / durationSec));
-        double target = totalBudget * fraction;
-        if (target <= actual) {
-            return 1.0;
-        }
-        double factor = target / actual;
-        return Math.min(factor, properties.getStrategy().getCatchUpMax());
-    }
-
-    /**
      * Count one auction we bid in, refresh the total budget from the live catalog size, and
      * lazily start the pacing clock if it wasn't configured.
      *
@@ -138,11 +100,6 @@ public class PacingController {
      * @param payment what we paid this auction: the clearing price if we won, 0.0 if we lost.
      */
     public void onOutcome(double payment) {
-        // Accumulate what we actually spent (0 on a loss) so catchUpFactor can compare cumulative
-        // spend against the linear-pace target. Rounded to cents to keep the running total exact.
-        if (payment > 0) {
-            spentCents.addAndGet(Math.round(payment * 100));
-        }
         double rho = targetPerAuction();
         BidderProperties.Strategy s = properties.getStrategy();
         double next = lambda - s.getPacingEta() * (rho - payment);
