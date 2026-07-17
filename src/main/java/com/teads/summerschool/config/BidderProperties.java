@@ -47,6 +47,15 @@ public class BidderProperties {
         // the market window — so one crazy-high winning bid can't drag our anchor up and make us
         // overpay. See BidderStatsCache.recordMarketPrice.
         private double marketOutlierMultiplier = 3.0;
+        // Late-run budget catch-up (see PacingController.catchUpFactor). Only engages in the final
+        // stretch of the competition — being under linear pace earlier is normal and correct in a
+        // cheap first-price market, so boosting then just overpays and wins fewer impressions per
+        // dollar (the bug in the original always-on 3× version). catchUpStartFraction: fraction of
+        // the window that must elapse before catch-up turns on (0.75 = final 25%). catchUpMax: the
+        // gentle ceiling on the boost — deliberately small so we spend leftover budget without
+        // grossly overpaying. enforceConstraints still clamps the result to the creative cap.
+        private double catchUpStartFraction = 0.75;
+        private double catchUpMax = 1.25;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -77,6 +86,12 @@ public class BidderProperties {
 
         public double getMarketOutlierMultiplier() { return marketOutlierMultiplier; }
         public void setMarketOutlierMultiplier(double marketOutlierMultiplier) { this.marketOutlierMultiplier = marketOutlierMultiplier; }
+
+        public double getCatchUpStartFraction() { return catchUpStartFraction; }
+        public void setCatchUpStartFraction(double catchUpStartFraction) { this.catchUpStartFraction = catchUpStartFraction; }
+
+        public double getCatchUpMax() { return catchUpMax; }
+        public void setCatchUpMax(double catchUpMax) { this.catchUpMax = catchUpMax; }
     }
 
     public static class Competition {

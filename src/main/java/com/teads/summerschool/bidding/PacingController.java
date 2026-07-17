@@ -48,6 +48,11 @@ public class PacingController {
     // Auctions we have actually bid in, used to estimate the total horizon T live.
     private final AtomicLong participations = new AtomicLong(0);
 
+    // Actual spend so far, in cents (clearing price summed over every auction we won). Compared
+    // against the linear-pace target in catchUpFactor to decide whether to spend leftover budget
+    // late in the run. Cents (long) so the running total is exact and lock-free — see onOutcome.
+    private final AtomicLong spentCents = new AtomicLong(0);
+
     // Total budget B across all our creatives. Budget is tracked per creative (flat
     // creativeBudget each), so B = creativeBudget * catalog size. The catalog can change at
     // runtime, so BiddingService refreshes this from the size it already collected per bid.
@@ -81,6 +86,48 @@ public class PacingController {
     }
 
     /**
+     * Late-run catch-up multiplier: spend leftover budget before the deadline instead of finishing
+     * the run under budget, WITHOUT the runaway overpayment of the original always-on version.
+     *
+     * <p>Two guards make this safe where the first attempt wasn't:
+     * <ul>
+     *   <li><b>Only late.</b> Returns 1.0 (no boost) until {@code catchUpStartFraction} of the window
+     *       has elapsed. Being under linear pace earlier is normal and correct in a cheap first-price
+     *       market — boosting then just overpays and wins fewer impressions per dollar. We only care
+     *       about unspent budget once there's little time left to spend it.</li>
+     *   <li><b>Gently.</b> The boost is clipped to {@code [1, catchUpMax]} with {@code catchUpMax}
+     *       small (~1.25), so even when badly behind we lift bids modestly, not toward the cap.</li>
+     * </ul>
+     * The factor is {@code target/actual} — how far behind linear pace we are — but only within the
+     * late window and only up to the gentle cap. {@link BiddingService#computeBidPrice} multiplies the
+     * anchor by this and {@code enforceConstraints} still clamps to the creative cap.
+     *
+     * <p>Returns 1.0 until the clock is running and we've spent something, so it never divides by
+     * zero and never boosts before there's a pace to fall behind.
+     */
+    public double catchUpFactor() {
+        Instant s = start;
+        long durationSec = properties.getCompetition().getDurationSeconds();
+        double actual = spentCents.get() / 100.0;
+        if (s == null || durationSec <= 0 || actual <= 0) {
+            return 1.0;
+        }
+        double elapsedSec = Duration.between(s, Instant.now()).toMillis() / 1000.0;
+        double fraction = Math.min(1.0, Math.max(0.0, elapsedSec / durationSec));
+        // Off until the final stretch: the whole point is to spend LEFTOVER budget near the end,
+        // not to chase pace early (which is what over-spent and lost us wins before).
+        if (fraction < properties.getStrategy().getCatchUpStartFraction()) {
+            return 1.0;
+        }
+        double target = totalBudget * fraction;
+        if (target <= actual) {
+            return 1.0;
+        }
+        double factor = target / actual;
+        return Math.min(factor, properties.getStrategy().getCatchUpMax());
+    }
+
+    /**
      * Count one auction we bid in, refresh the total budget from the live catalog size, and
      * lazily start the pacing clock if it wasn't configured.
      *
@@ -100,6 +147,11 @@ public class PacingController {
      * @param payment what we paid this auction: the clearing price if we won, 0.0 if we lost.
      */
     public void onOutcome(double payment) {
+        // Accumulate what we actually spent (0 on a loss) so catchUpFactor can compare cumulative
+        // spend against the linear-pace target. Rounded to cents to keep the running total exact.
+        if (payment > 0) {
+            spentCents.addAndGet(Math.round(payment * 100));
+        }
         double rho = targetPerAuction();
         BidderProperties.Strategy s = properties.getStrategy();
         double next = lambda - s.getPacingEta() * (rho - payment);

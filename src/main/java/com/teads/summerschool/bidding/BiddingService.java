@@ -63,6 +63,8 @@ public class BiddingService {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
         // Expose the pacing multiplier so we can watch the controller react during a run.
         metrics.registerGauge("pacing.lambda", pacing::getLambda);
+        // Expose the catch-up multiplier so we can see when we're behind pace and bidding up.
+        metrics.registerGauge("pacing.catchup", pacing::catchUpFactor);
     }
 
     /**
@@ -298,6 +300,11 @@ public class BiddingService {
         }
         // Never bid below what it takes to clear the floor with our cold-start margin.
         bid = Math.max(bid, floor * s.getColdStartMultiplier());
+
+        // Late-run catch-up: only in the final stretch of the competition, and only gently, lift the
+        // bid to spend leftover budget before the deadline. 1.0 (no-op) for most of the run, so the
+        // efficient win-cheap behavior is preserved; enforceConstraints still clamps to the cap.
+        bid *= pacing.catchUpFactor();
 
         // enforceConstraints caps this at the creative's max bid, so the cap is a ceiling, not a target.
         return enforceConstraints(bid, floor, creative);
